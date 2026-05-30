@@ -72,16 +72,49 @@ jobs:
 
             echo "==> Stopping old containers..."
             cd /opt/meeting-app
-            docker compose down
+            docker compose down || true
 
-            echo "==> Starting services..."
-            docker compose up -d
+            echo "==> Checking .env file..."
+            if [ ! -f .env ]; then
+              echo "WARNING: .env file not found! Creating default .env..."
+              cat > .env << 'ENVEOF'
+ARK_API_KEY=
+AI_API_KEY=
+AI_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
+AI_MODEL=doubao-seed-1-8-251228
+STT_API_KEY=
+STT_BASE_URL=https://api.siliconflow.cn/v1
+STT_MODEL=TeleAI/TeleSpeechASR
+PORT=3001
+BIND_HOST=0.0.0.0
+MYSQL_HOST=mysql
+MYSQL_PORT=3306
+MYSQL_USER=root
+MYSQL_PASSWORD=root
+MYSQL_DATABASE=zglxm
+ENVEOF
+            fi
+            cat .env
+
+            echo "==> Starting MySQL first..."
+            docker compose up -d mysql
+            echo "==> Waiting for MySQL to be healthy..."
+            sleep 15
+
+            echo "==> Starting app and nginx..."
+            docker compose up -d --no-deps app
+            echo "==> Waiting for app to start..."
+            sleep 10
+
+            docker compose up -d --no-deps nginx
+
+            echo "==> Checking container status..."
+            docker compose ps
+
+            echo "==> App logs:"
+            docker compose logs --tail=30 app
 
             echo "==> Cleaning up old images..."
             docker image prune -f
-
-            echo "==> Waiting for health checks..."
-            sleep 10
-            docker compose ps
 
             echo "==> Deploy complete."
