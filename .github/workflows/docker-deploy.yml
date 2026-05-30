@@ -60,29 +60,21 @@ jobs:
           port: ${{ secrets.DEPLOY_SSH_PORT || 22 }}
           script: |
             set -e
-
             IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
-
             echo "==> Saving GHCR credentials on server..."
             mkdir -p ~/.docker
             echo "${{ secrets.GHCR_TOKEN }}" | docker login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
-
             echo "==> Pulling latest image..."
             docker pull "$IMAGE"
-
             echo "==> Stopping old containers..."
             cd /opt/meeting-app
             docker compose down || true
-
             echo "==> Checking .env file..."
-            if [ ! -f .env ]; then
-              echo "WARNING: .env file not found! Creating default .env..."
-              cat > .env << 'ENVEOF'
-ARK_API_KEY=
-AI_API_KEY=
+            test -f .env || echo "ARK_API_KEY=a4fec08a-239b-4f00-8472-a8b487caf543
+AI_API_KEY=sk-ulktqxaaxvfbnglgqcaavrwwqhalyxukrlylhjplortwxgvy
 AI_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
 AI_MODEL=doubao-seed-1-8-251228
-STT_API_KEY=
+STT_API_KEY=sk-ulktqxaaxvfbnglgqcaavrwwqhalyxukrlylhjplortwxgvy
 STT_BASE_URL=https://api.siliconflow.cn/v1
 STT_MODEL=TeleAI/TeleSpeechASR
 PORT=3001
@@ -91,30 +83,19 @@ MYSQL_HOST=mysql
 MYSQL_PORT=3306
 MYSQL_USER=root
 MYSQL_PASSWORD=root
-MYSQL_DATABASE=zglxm
-ENVEOF
-            fi
-            cat .env
-
-            echo "==> Starting MySQL first..."
+MYSQL_DATABASE=zglxm" > .env
+            echo "==> Starting MySQL..."
             docker compose up -d mysql
-            echo "==> Waiting for MySQL to be healthy..."
             sleep 15
-
-            echo "==> Starting app and nginx..."
+            echo "==> Starting app..."
             docker compose up -d --no-deps app
-            echo "==> Waiting for app to start..."
             sleep 10
-
+            echo "==> Starting nginx..."
             docker compose up -d --no-deps nginx
-
-            echo "==> Checking container status..."
+            echo "==> Status:"
             docker compose ps
-
             echo "==> App logs:"
             docker compose logs --tail=30 app
-
-            echo "==> Cleaning up old images..."
+            echo "==> Cleaning up..."
             docker image prune -f
-
             echo "==> Deploy complete."
