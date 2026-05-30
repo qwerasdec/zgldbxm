@@ -53,7 +53,4 @@ ENV PORT=3001
 
 EXPOSE 3001
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-  CMD curl -sf http://127.0.0.1:3001/api/stt/status || exit 1
-
 ENTRYPOINT ["/app/docker-entrypoint.sh"]

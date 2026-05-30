@@ -40,12 +40,6 @@ services:
       NODE_ENV: production
     volumes:
       - app-dist:/usr/share/nginx/html
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://127.0.0.1:3001/api/stt/status"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 15s
     networks:
       - app-net
 
@@ -54,8 +48,7 @@ services:
     image: nginx:1.25-alpine
     restart: unless-stopped
     depends_on:
-      app:
-        condition: service_healthy
+      - app
     ports:
       - "80:80"
     volumes:
