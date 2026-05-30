@@ -1,0 +1,15 @@
+node_modules
+dist
+dist-ssr
+.git
+.github
+.env
+.env.*
+!.env.example
+*.md
+*.log
+release
+deploy-upload.zip
+.vscode
+.idea
+.DS_Store

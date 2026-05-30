@@ -1,0 +1,80 @@
+version: '3.8'
+
+services:
+  # ── MySQL ──────────────────────────────────────────────
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_PASSWORD:-root}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-zglxm}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    # No port mapping -- MySQL is internal only
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_PASSWORD:-root}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - app-net
+
+  # ── Node.js signaling server ───────────────────────────
+  app:
+    image: ghcr.io/${GITHUB_REPOSITORY:-qwerasdec/zgldbxm}:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      # Override .env values for Docker networking
+      MYSQL_HOST: mysql
+      BIND_HOST: 0.0.0.0
+      PORT: 3001
+      NODE_ENV: production
+    volumes:
+      - app-dist:/usr/share/nginx/html
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:3001/api/auth/me"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    networks:
+      - app-net
+
+  # ── Nginx reverse proxy ────────────────────────────────
+  nginx:
+    image: nginx:1.25-alpine
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+    ports:
+      - "80:80"
+    volumes:
+      - ./deploy/nginx-docker.conf:/etc/nginx/conf.d/default.conf:ro
+      - app-dist:/usr/share/nginx/html:ro
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      - app-net
+
+volumes:
+  mysql_data:
+    driver: local
+  app-dist:
+    driver: local
+
+networks:
+  app-net:
+    driver: bridge

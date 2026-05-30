@@ -1,0 +1,63 @@
+# 推送到 main 分支后自动构建并部署到阿里云 ECS
+# 需在 GitHub 仓库 Settings → Secrets 配置：DEPLOY_HOST、DEPLOY_USER、DEPLOY_SSH_KEY
+
+name: Deploy to ECS
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-ecs
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install & build
+        run: |
+          npm ci
+          npm run build
+          bash deploy/verify-dist.sh
+
+      - name: Upload artifacts to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_SSH_PORT || 22 }}
+          source: 'dist,server,deploy,package.json,package-lock.json'
+          target: '/opt/meeting-app'
+          overwrite: true
+
+      - name: Install production deps & restart PM2
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_SSH_PORT || 22 }}
+          script: |
+            set -e
+            cd /opt/meeting-app
+            npm ci --omit=dev
+            if pm2 describe meeting-signal >/dev/null 2>&1; then
+              pm2 restart meeting-signal
+            else
+              pm2 start deploy/ecosystem.config.cjs
+            fi
+            pm2 save
+            curl -sf -o /dev/null http://127.0.0.1:3001/api/auth/me || echo "warn: signal health check"
+            echo "Deploy done."
