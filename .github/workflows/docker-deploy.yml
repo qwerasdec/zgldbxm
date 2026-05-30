@@ -62,8 +62,9 @@ jobs:
 
             IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
 
-            echo "==> Logging in to GHCR..."
-            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
+            echo "==> Saving GHCR credentials on server..."
+            mkdir -p ~/.docker
+            echo "${{ secrets.GHCR_TOKEN }}" | docker login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
 
             echo "==> Pulling latest image..."
             docker pull "$IMAGE"
