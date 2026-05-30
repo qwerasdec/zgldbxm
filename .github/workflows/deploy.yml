@@ -1,11 +1,9 @@
-# 推送到 main 分支后自动构建并部署到阿里云 ECS
+# 旧的 SCP+PM2 部署方式（已弃用，请使用 docker-deploy.yml）
 # 需在 GitHub 仓库 Settings → Secrets 配置：DEPLOY_HOST、DEPLOY_USER、DEPLOY_SSH_KEY
 
-name: Deploy to ECS
+name: Deploy to ECS (deprecated)
 
 on:
-  push:
-    branches: [main, master]
   workflow_dispatch:
 
 concurrency:
