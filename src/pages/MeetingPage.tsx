@@ -836,7 +836,6 @@ function MeetingPage() {
     pendingCandidatesRef.current.set(peerId, queue)
   }
 
-  const isPolitePeer = (selfId: string, remoteId: string) => selfId.localeCompare(remoteId) > 0
 
   /** socket id 较小的一方发起 offer，避免双方同时 offer 或重连后无人 offer */
   const shouldInitiateOffer = (selfId: string, remoteId: string) =>
@@ -1101,7 +1100,18 @@ function MeetingPage() {
         // 重新发送 offer 以携带音视频轨道，修复远端看不到摄像头的问题。
         if (peersRef.current.size > 0) {
           peersRef.current.forEach((connection, peerId) => {
-            if (connection.signalingState === 'stable') {
+            if (connection.signalingState !== 'stable') {
+              return
+            }
+            const localStream = streamRef.current
+            if (!localStream) {
+              return
+            }
+            const senders = connection.getSenders()
+            const needAudio = localStream.getAudioTracks()[0] && !senders.some((s) => s.track?.kind === 'audio')
+            const videoTrack = screenTrackRef.current ?? localStream.getVideoTracks()[0]
+            const needVideo = videoTrack && !senders.some((s) => s.track?.kind === 'video')
+            if (needAudio || needVideo) {
               void makeOffer(peerId)
             }
           })
@@ -1384,21 +1394,9 @@ function MeetingPage() {
     })
 
     socket.on('signal', async ({ fromId, signal }: { fromId: string; signal: RoomMessage }) => {
-      const selfId = localMemberIdRef.current
       const connection = createPeerConnection(fromId)
       try {
         if (signal.type === 'offer') {
-          const offerCollision =
-            signal.type === 'offer' &&
-            (connection.signalingState === 'have-local-offer' ||
-              connection.signalingState === 'have-remote-offer')
-          if (offerCollision && !isPolitePeer(selfId, fromId)) {
-            console.warn(`[WebRTC] ignore glare offer from ${fromId}`)
-            return
-          }
-          if (offerCollision && isPolitePeer(selfId, fromId)) {
-            await connection.setLocalDescription({ type: 'rollback' } as RTCSessionDescriptionInit)
-          }
           await connection.setRemoteDescription(new RTCSessionDescription(signal.sdp))
           const answer = await connection.createAnswer()
           await connection.setLocalDescription(answer)
@@ -2637,6 +2635,51 @@ function MeetingPage() {
               </button>
             </div>
           ) : null}
+
+          <section className="agent-mvp-section">
+            <h3>智能体 MVP</h3>
+            <div className="chat-panel">
+              {agentAnswer ? (
+                <>
+                  {agentPlan.length > 0 ? (
+                    <div className="chat-time">
+                      计划：{agentPlan.map((p, idx) => `${idx + 1}.${p}`).join('  ')}
+                    </div>
+                  ) : null}
+                  <pre className="summary-text">{agentAnswer}</pre>
+                  {agentSteps.length > 0 ? (
+                    <div className="chat-time">
+                      工具执行：
+                      {agentSteps.map((step, idx) => (
+                        <div key={`${step.tool}-${idx}`}>
+                          {idx + 1}. {step.tool}（{step.reason}）
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+                  {agentReview ? (
+                    <div className="chat-time">
+                      复盘：
+                      <div>{agentReview}</div>
+                    </div>
+                  ) : null}
+                </>
+              ) : (
+                <p>输入目标后自动规划步骤并输出结论（答辩/会议纪要场景）。</p>
+              )}
+            </div>
+            <div className="chat-input-row">
+              <input
+                value={agentGoal}
+                onChange={(event) => setAgentGoal(event.target.value)}
+                placeholder="例如：根据会中消息生成答辩行动计划"
+              />
+              <button onClick={() => void runAgentMvp()} disabled={agentLoading}>
+                {agentLoading ? '执行中...' : '运行智能体'}
+              </button>
+            </div>
+          </section>
+
           <h3>会中消息</h3>
           {privateChatTargetId ? (
             <p className="chat-private-hint">
@@ -2756,48 +2799,6 @@ function MeetingPage() {
             />
             <button onClick={() => void askAi()} disabled={aiLoading}>
               {aiLoading ? '思考中...' : '提问 AI'}
-            </button>
-          </div>
-
-          <h3>智能体 MVP</h3>
-          <div className="chat-panel">
-            {agentAnswer ? (
-              <>
-                {agentPlan.length > 0 ? (
-                  <div className="chat-time">
-                    计划：{agentPlan.map((p, idx) => `${idx + 1}.${p}`).join('  ')}
-                  </div>
-                ) : null}
-                <pre className="summary-text">{agentAnswer}</pre>
-                {agentSteps.length > 0 ? (
-                  <div className="chat-time">
-                    工具执行：
-                    {agentSteps.map((step, idx) => (
-                      <div key={`${step.tool}-${idx}`}>
-                        {idx + 1}. {step.tool}（{step.reason}）
-                      </div>
-                    ))}
-                  </div>
-                ) : null}
-                {agentReview ? (
-                  <div className="chat-time">
-                    复盘：
-                    <div>{agentReview}</div>
-                  </div>
-                ) : null}
-              </>
-            ) : (
-              <p>输入一个目标，智能体会自动规划步骤并给出结论（MVP）。</p>
-            )}
-          </div>
-          <div className="chat-input-row">
-            <input
-              value={agentGoal}
-              onChange={(event) => setAgentGoal(event.target.value)}
-              placeholder="例如：根据会中消息生成答辩行动计划"
-            />
-            <button onClick={() => void runAgentMvp()} disabled={agentLoading}>
-              {agentLoading ? '执行中...' : '运行智能体'}
             </button>
           </div>
 

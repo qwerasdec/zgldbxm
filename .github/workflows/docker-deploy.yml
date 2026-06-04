@@ -45,8 +45,8 @@ jobs:
             echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
             docker pull ghcr.io/${{ github.repository }}:latest
             cd /opt/meeting-app
-            docker compose down
-            docker compose up -d
-            sleep 15
+            docker compose up -d --force-recreate --no-deps app nginx
+            sleep 8
+            docker exec meeting-app-nginx-1 ls -la /usr/share/nginx/html/assets/
             docker compose ps
             docker compose logs --tail=20 app

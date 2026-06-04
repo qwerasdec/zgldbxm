@@ -415,6 +415,19 @@ a {
   margin: 0 0 8px;
 }
 
+.agent-mvp-section {
+  margin: 12px 0 16px;
+  padding: 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(99, 179, 237, 0.45);
+  background: rgba(30, 58, 95, 0.35);
+}
+
+.agent-mvp-section h3 {
+  margin-top: 0;
+  color: #90cdf4;
+}
+
 .meeting-sidebar ul {
   margin: 0 0 16px;
   padding-left: 18px;
