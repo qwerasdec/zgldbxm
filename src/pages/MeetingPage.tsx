@@ -200,6 +200,9 @@ function MeetingPage() {
   const [virtualBgError, setVirtualBgError] = useState('')
   /** MediaPipe 不可用时的整画面 CSS 模糊（仅 blur 模式） */
   const [virtualBgSimpleBlur, setVirtualBgSimpleBlur] = useState(false)
+  const [whiteboardColor, setWhiteboardColor] = useState('#61a0ff')
+  const [whiteboardLineWidth, setWhiteboardLineWidth] = useState(3)
+  const [whiteboardTool, setWhiteboardTool] = useState<'pen' | 'eraser'>('pen')
 
   const localVideoRef = useRef<HTMLVideoElement | null>(null)
   const recordPlayerRef = useRef<HTMLVideoElement | null>(null)
@@ -567,8 +570,9 @@ function MeetingPage() {
       return
     }
 
-    const width = Math.max(320, Math.min(960, video.videoWidth || 960))
-    const height = Math.max(240, Math.min(540, video.videoHeight || 540))
+    // 分辨率过高时 MediaPipe WASM 易报 memory access out of bounds
+    const width = Math.max(320, Math.min(640, video.videoWidth || 640))
+    const height = Math.max(240, Math.min(360, video.videoHeight || 360))
     canvas.width = width
     canvas.height = height
     const ctx = canvas.getContext('2d')
@@ -647,7 +651,7 @@ function MeetingPage() {
     const seg = new SelfieSegmentationCtor({
       locateFile: locateMpFile,
     })
-    seg.setOptions({ modelSelection: 1 })
+    seg.setOptions({ modelSelection: 0 })
     virtualSegRef.current = seg
 
     try {
@@ -742,8 +746,14 @@ function MeetingPage() {
       try {
         await virtualSegRef.current.send({ image: video })
       } catch (error) {
-        stopVirtualBackground()
         const detail = error instanceof Error ? error.message : String(error ?? 'unknown')
+        const wasmLike =
+          /memory access out of bounds|wasm|RuntimeError|abort/i.test(detail)
+        stopVirtualBackground({ keepSimpleBlur: false })
+        if (virtualBgModeRef.current === 'blur' || wasmLike) {
+          applySimpleBlurFallback()
+          return
+        }
         setRtcTip(`虚拟背景失败：${detail.slice(0, 180)}`)
         setVirtualBgStatus('error')
         setVirtualBgError(detail.slice(0, 220))
@@ -1351,7 +1361,15 @@ function MeetingPage() {
 
     socket.on(
       'whiteboard-draw',
-      (stroke: { x0: number; y0: number; x1: number; y1: number; color: string }) => {
+      (stroke: {
+        x0: number
+        y0: number
+        x1: number
+        y1: number
+        color: string
+        lineWidth?: number
+        eraser?: boolean
+      }) => {
         const canvas = canvasRef.current
         if (!canvas) {
           return
@@ -1360,12 +1378,22 @@ function MeetingPage() {
         if (!ctx) {
           return
         }
-        ctx.strokeStyle = stroke.color
-        ctx.lineWidth = 2
+        ctx.save()
+        if (stroke.eraser) {
+          ctx.globalCompositeOperation = 'destination-out'
+          ctx.strokeStyle = 'rgba(0,0,0,1)'
+        } else {
+          ctx.globalCompositeOperation = 'source-over'
+          ctx.strokeStyle = stroke.color
+        }
+        ctx.lineWidth = stroke.lineWidth ?? 3
+        ctx.lineCap = 'round'
+        ctx.lineJoin = 'round'
         ctx.beginPath()
         ctx.moveTo(stroke.x0, stroke.y0)
         ctx.lineTo(stroke.x1, stroke.y1)
         ctx.stroke()
+        ctx.restore()
       },
     )
 
@@ -1921,7 +1949,9 @@ function MeetingPage() {
       }
       recorder.start(500)
       setRecording(true)
-      setRtcTip('录制已开始，请在弹窗中选择“当前标签页/窗口”。')
+      setRtcTip(
+        '正在录制会议画面（仅保存在你本机，其他人看不到）。请在弹窗里选「当前标签页」；这不是「共享屏幕」给参会者。',
+      )
       const firstTrack = pageStream.getVideoTracks()[0]
       if (firstTrack) {
         firstTrack.onended = () => {
@@ -2317,27 +2347,40 @@ function MeetingPage() {
     setRtcTip('已发送到「会中消息」，可继续输入或生成纪要。')
   }
  
-  const drawOnBoard = (event: MouseEvent<HTMLCanvasElement>) => {//白板绘制的核心函数，绑定在 Canvas 的 mousemove 事件上
+  const drawOnBoard = (event: MouseEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current
     if (!canvas || !isDrawingRef.current) {
       return
-    } //鼠标相对于浏览器窗口的坐标，项目中封装的工具函数，作用是把鼠标的窗口坐标转换成 Canvas 画布上的真实坐标
-    const { x: x1, y: y1 } = whiteboardPointerCoords(canvas, event.clientX, event.clientY)//把鼠标位置映射到 Canvas 画布
+    }
+    const { x: x1, y: y1 } = whiteboardPointerCoords(canvas, event.clientX, event.clientY)
     const ctx = canvas.getContext('2d')
     if (!ctx) {
       return
     }
     const prevX = Number(canvas.dataset.prevX ?? x1)
     const prevY = Number(canvas.dataset.prevY ?? y1)
-    ctx.strokeStyle = '#61a0ff'
-    ctx.lineWidth = 2
+    const isEraser = whiteboardTool === 'eraser'
+    const color = isEraser ? '#ffffff' : whiteboardColor
+    const width = isEraser ? Math.max(whiteboardLineWidth, 12) : whiteboardLineWidth
+    ctx.save()
+    if (isEraser) {
+      ctx.globalCompositeOperation = 'destination-out'
+      ctx.strokeStyle = 'rgba(0,0,0,1)'
+    } else {
+      ctx.globalCompositeOperation = 'source-over'
+      ctx.strokeStyle = color
+    }
+    ctx.lineWidth = width
+    ctx.lineCap = 'round'
+    ctx.lineJoin = 'round'
     ctx.beginPath()
     ctx.moveTo(prevX, prevY)
     ctx.lineTo(x1, y1)
     ctx.stroke()
+    ctx.restore()
     socketRef.current?.emit('whiteboard-draw', {
       roomId,
-      stroke: { x0: prevX, y0: prevY, x1, y1, color: '#61a0ff' },
+      stroke: { x0: prevX, y0: prevY, x1, y1, color, lineWidth: width, eraser: isEraser },
     })
     canvas.dataset.prevX = String(x1)
     canvas.dataset.prevY = String(y1)
@@ -2861,9 +2904,47 @@ function MeetingPage() {
       {showWhiteboard ? (
         <section className="whiteboard-panel" ref={whiteboardPanelRef}>
           <div className="whiteboard-tools">
-            <button onClick={clearBoard}>清空白板</button>
-            <button onClick={() => setShowWhiteboard(false)}>关闭白板</button>
+            <button
+              type="button"
+              className={whiteboardTool === 'pen' ? 'wb-tool-active' : ''}
+              onClick={() => setWhiteboardTool('pen')}
+            >
+              画笔
+            </button>
+            <button
+              type="button"
+              className={whiteboardTool === 'eraser' ? 'wb-tool-active' : ''}
+              onClick={() => setWhiteboardTool('eraser')}
+            >
+              橡皮擦
+            </button>
+            <label className="wb-color-label">
+              颜色
+              <input
+                type="color"
+                value={whiteboardColor}
+                onChange={(e) => setWhiteboardColor(e.target.value)}
+                disabled={whiteboardTool === 'eraser'}
+              />
+            </label>
+            <label className="wb-width-label">
+              粗细
+              <input
+                type="range"
+                min={2}
+                max={24}
+                value={whiteboardLineWidth}
+                onChange={(e) => setWhiteboardLineWidth(Number(e.target.value))}
+              />
+            </label>
+            <button type="button" onClick={clearBoard}>
+              清空白板
+            </button>
+            <button type="button" onClick={() => setShowWhiteboard(false)}>
+              关闭白板
+            </button>
           </div>
+          <p className="chat-time">在白色区域按住鼠标拖动即可绘制，参会者实时同步。</p>
           <canvas
             ref={canvasRef}
             className="whiteboard-canvas"
@@ -3109,7 +3190,7 @@ function MeetingPage() {
         </button>
         <button onClick={copyInviteLink}>复制邀请</button>
         <button onClick={() => (recording ? stopRecording() : void startRecording())}>
-          {recording ? '停止录制' : '开始录制'}
+          {recording ? '停止录制' : '录制会议'}
         </button>
       </footer>
     </main>

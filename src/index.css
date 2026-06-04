@@ -705,8 +705,37 @@ a {
 
 .whiteboard-tools {
   display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   gap: 8px;
   margin-bottom: 10px;
+}
+
+.whiteboard-tools .wb-tool-active {
+  background: rgba(47, 116, 255, 0.55);
+  outline: 1px solid rgba(255, 255, 255, 0.35);
+}
+
+.wb-color-label,
+.wb-width-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.wb-color-label input[type='color'] {
+  width: 32px;
+  height: 28px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+}
+
+.wb-width-label input[type='range'] {
+  width: 88px;
 }
 
 .whiteboard-tools button {

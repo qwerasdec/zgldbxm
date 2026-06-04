@@ -152,6 +152,7 @@ const handleAiChat = async (req, res) => {
   const username = String(payload.username ?? '参会者')
   const prompt = String(payload.prompt ?? '')
   const messages = Array.isArray(payload.messages) ? payload.messages : []
+  const history = Array.isArray(payload.history) ? payload.history : []
 
   if (!prompt.trim()) {
     res.writeHead(400, { 'Content-Type': 'application/json' })
@@ -175,17 +176,26 @@ const handleAiChat = async (req, res) => {
     .join('\n')
   const hasChat = messages.some((item) => String(item.text ?? '').trim())
 
+  const historyMessages = history
+    .slice(-10)
+    .filter((item) => item?.role && item?.content)
+    .map((item) => ({
+      role: item.role === 'assistant' ? 'assistant' : 'user',
+      content: String(item.content ?? '').slice(0, 2000),
+    }))
+
   try {
     const answer = await callOpenAI(
       [
         {
           role: 'system',
           content:
-            '你是在线会议助手。请用中文回答，优先提炼重点，输出简洁、可执行、适合答辩场景。严禁编造聊天记录中不存在的具体发言或事实。',
+            '你是在线会议助手。必须直接回答用户「当前问题」，不要答非所问。可结合会中聊天记录作参考，但严禁编造未出现的具体发言。用中文，简洁可执行。',
         },
+        ...historyMessages,
         {
           role: 'user',
-          content: `会议号: ${roomId}\n提问人: ${username}\n会中聊天记录:\n${contextLines || '（暂无）'}\n\n问题: ${prompt}${hasChat ? '' : '\n\n说明：当前会中聊天为空，请先明确说明「暂无会中文字记录」，勿虚构会议讨论；可给出与问题相关的通用答辩建议。'}`,
+          content: `会议号: ${roomId}\n提问人: ${username}\n会中聊天记录:\n${contextLines || '（暂无）'}\n\n【当前问题】${prompt}${hasChat ? '' : '\n\n说明：会中聊天为空，请先说明暂无记录，再给出与问题相关的通用建议。'}`,
         },
       ],
       0.4,
@@ -197,7 +207,7 @@ const handleAiChat = async (req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' })
     res.end(
       JSON.stringify({
-        answer: `AI 服务调用失败，已切换演示模式。\n问题：${prompt}\n建议：请检查 AI_API_KEY、AI_BASE_URL、AI_MODEL 和网络连通性。`,
+        answer: `AI 服务调用失败，已切换演示模式。\n【你的问题】${prompt}\n建议：请检查 AI_API_KEY、AI_BASE_URL、AI_MODEL 和网络连通性。`,
         degraded: true,
         detail: error instanceof Error ? error.message : 'Unknown error',
       }),
@@ -362,6 +372,7 @@ const handleAiAgent = async (req, res) => {
   const username = String(payload.username ?? '参会者')
   const messages = Array.isArray(payload.messages) ? payload.messages : []
   const members = Array.isArray(payload.members) ? payload.members : []
+  const history = Array.isArray(payload.history) ? payload.history : []
 
   if (!goal) {
     res.writeHead(400, { 'Content-Type': 'application/json' })
@@ -399,30 +410,44 @@ const handleAiAgent = async (req, res) => {
     return
   }
 
+  const contextLines = messages
+    .slice(-30)
+    .map((item) => `${item.sender ?? '成员'}: ${item.text ?? ''}`)
+    .join('\n')
+  const historyMessages = history
+    .slice(-8)
+    .filter((item) => item?.role && item?.content)
+    .map((item) => ({
+      role: item.role === 'assistant' ? 'assistant' : 'user',
+      content: String(item.content ?? '').slice(0, 2000),
+    }))
+
   try {
     const toolContext = steps.map((s, i) => `${i + 1}. [${s.tool}] ${s.reason}\n${s.output}`).join('\n\n')
     const draft = await callOpenAI(
       [
         {
           role: 'system',
-          content: '你是会议智能体的执行器。请基于工具输出给出“草稿答案”，结构包含：结论、证据、行动项、下一步。不要编造事实。',
+          content:
+            '你是会议智能体。第一要务：直接回答用户提出的「目标/问题」，不要跑题到无关的会议流程。可引用会中记录与工具输出作为证据，禁止编造。',
         },
+        ...historyMessages,
         {
           role: 'user',
-          content: `会议号：${roomId}\n提问人：${username}\n目标：${goal}\n执行计划：\n${plan.map((p, i) => `${i + 1}. ${p}`).join('\n')}\n\n工具输出：\n${toolContext}`,
+          content: `【用户目标/问题】${goal}\n会议号：${roomId}\n提问人：${username}\n会中记录：\n${contextLines || '（暂无）'}\n\n工具输出：\n${toolContext}`,
         },
       ],
-      0.3,
+      0.35,
     )
     const review = await callOpenAI(
       [
         {
           role: 'system',
-          content: '你是会议智能体复盘器。请检查草稿是否有臆测、遗漏、行动项不明确，并给出简短复盘建议（3-5行）。',
+          content: '检查草稿是否回答了用户目标、有无臆测。3-5 行简短复盘。',
         },
         {
           role: 'user',
-          content: `目标：${goal}\n\n工具输出：\n${toolContext}\n\n草稿：\n${draft}`,
+          content: `用户目标：${goal}\n\n草稿：\n${draft}`,
         },
       ],
       0.2,
@@ -432,14 +457,14 @@ const handleAiAgent = async (req, res) => {
         {
           role: 'system',
           content:
-            '你是会议智能体终稿器。请根据草稿和复盘意见生成最终回答，格式固定：\n1) 结论\n2) 证据\n3) 行动项（负责人+截止建议）\n4) 下一步\n不得编造未出现的事实。',
+            '生成最终回答。开头用 1-2 句话直接回应用户目标。然后分点：结论、依据（来自会中记录或工具）、行动项、下一步。不得编造事实。',
         },
         {
           role: 'user',
-          content: `目标：${goal}\n\n草稿：\n${draft}\n\n复盘意见：\n${review}`,
+          content: `用户目标：${goal}\n\n草稿：\n${draft}\n\n复盘：\n${review}`,
         },
       ],
-      0.25,
+      0.3,
     )
     res.writeHead(200, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify({ answer, plan, steps, review }))
