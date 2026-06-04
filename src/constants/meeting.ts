@@ -36,19 +36,25 @@ export const MEETING_RECORDS_KEY = 'tm-meeting-records'
 export const SCHEDULED_MEETINGS_KEY = 'tm-scheduled-meetings'
 export const USERS_KEY = 'tm-users'
 
+function buildIceServers(): RTCIceServer[] {
+  const servers: RTCIceServer[] = [
+    { urls: 'stun:stun.cloudflare.com:3478' },
+    { urls: 'stun:stun.l.google.com:19302' },
+  ]
+  // 与 deploy/setup-coturn.sh 默认账号一致；手机热点对称 NAT 需 TURN 中继
+  if (typeof window !== 'undefined' && window.location.hostname) {
+    const host = window.location.hostname
+    servers.push({
+      urls: [`turn:${host}:3478`, `turn:${host}:3478?transport=tcp`],
+      username: 'turnuser',
+      credential: 'turnpass123',
+    })
+  }
+  return servers
+}
+
 export const RTC_CONFIG: RTCConfiguration = {
-  iceServers: [
-    {
-      urls: [
-        // 国内可用的 STUN 服务器
-        'stun:stun.miwifi.com:3478',
-        'stun:stun.banber.top:3478',
-        // Google 公共 STUN（海外可用，国内部分网络受限）
-        'stun:stun.l.google.com:19302',
-        'stun:stun1.l.google.com:19302',
-      ],
-    },
-  ],
+  iceServers: buildIceServers(),
   iceCandidatePoolSize: 4,
 }
 

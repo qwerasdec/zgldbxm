@@ -1111,7 +1111,7 @@ a {
   }
 
   .meeting-sidebar {
-    max-height: 42vh;
+    max-height: 70vh;
     overflow: auto;
   }
 }

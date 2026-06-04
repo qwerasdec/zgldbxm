@@ -5,7 +5,7 @@ import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import RemoteVideo from '../components/RemoteVideo'
 import { RTC_CONFIG, SIGNAL_SERVER_URL } from '../constants/meeting'
 import type { ChatMessage, MeetingRecord, MemberState, RoomMessage, RoomMeta } from '../types/meeting'
-import { askAiAssistant, generateAiSummary } from '../utils/ai'
+import { askAiAssistant, generateAiSummary, runAiAgent } from '../utils/ai'
 import { saveMeetingRecordRemote } from '../utils/storage'
 
 function arrayBufferToBase64(buffer: ArrayBuffer) {
@@ -130,8 +130,18 @@ function MeetingPage() {
   const [privateChatTargetId, setPrivateChatTargetId] = useState('')
   const [aiPrompt, setAiPrompt] = useState('')
   const [aiAnswer, setAiAnswer] = useState('')
+  /** AI 助手对话历史：role + content */
+  const aiChatHistoryRef = useRef<Array<{ role: 'user' | 'assistant'; content: string }>>([])
+  const [agentGoal, setAgentGoal] = useState('')
+  const [agentAnswer, setAgentAnswer] = useState('')
+  const [agentPlan, setAgentPlan] = useState<string[]>([])
+  const [agentReview, setAgentReview] = useState('')
+  const [agentSteps, setAgentSteps] = useState<Array<{ tool: string; reason: string; output: string }>>([])
+  /** 智能体对话历史 */
+  const agentHistoryRef = useRef<Array<{ role: 'user' | 'assistant'; content: string }>>([])
   const [aiSummary, setAiSummary] = useState('')
   const [aiLoading, setAiLoading] = useState(false)
+  const [agentLoading, setAgentLoading] = useState(false)
   const [summaryLoading, setSummaryLoading] = useState(false)
   /** 文字转写识别中的临时文本（同时显示在会中消息区域底部） */
   const [transcribingPreview, setTranscribingPreview] = useState('')
@@ -237,6 +247,7 @@ function MeetingPage() {
   const virtualCtorPromiseRef = useRef<Promise<any> | null>(null)
   const socketRef = useRef<Socket | null>(null)
   const peersRef = useRef<Map<string, RTCPeerConnection>>(new Map())
+  const pendingCandidatesRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map())
   const localMemberIdRef = useRef('')
   const joinPasswordRef = useRef(initialPassword)
   const clientKeyRef = useRef('')
@@ -807,6 +818,45 @@ function MeetingPage() {
     }
   }, [recordSaveMode])
 
+  const flushPendingCandidates = async (peerId: string, connection: RTCPeerConnection) => {
+    const queue = pendingCandidatesRef.current.get(peerId) ?? []
+    pendingCandidatesRef.current.delete(peerId)
+    for (const candidate of queue) {
+      try {
+        await connection.addIceCandidate(new RTCIceCandidate(candidate))
+      } catch (error) {
+        console.warn(`[WebRTC] queued candidate failed for ${peerId}`, error)
+      }
+    }
+  }
+
+  const queuePendingCandidate = (peerId: string, candidate: RTCIceCandidateInit) => {
+    const queue = pendingCandidatesRef.current.get(peerId) ?? []
+    queue.push(candidate)
+    pendingCandidatesRef.current.set(peerId, queue)
+  }
+
+  const isPolitePeer = (selfId: string, remoteId: string) => selfId.localeCompare(remoteId) > 0
+
+  /** socket id 较小的一方发起 offer，避免双方同时 offer 或重连后无人 offer */
+  const shouldInitiateOffer = (selfId: string, remoteId: string) =>
+    Boolean(selfId && remoteId && selfId.localeCompare(remoteId) < 0)
+
+  const scheduleOffer = (peerId: string, waitForStream = true) => {
+    const tryOffer = (retries = 0) => {
+      const selfId = localMemberIdRef.current
+      if (!shouldInitiateOffer(selfId, peerId)) {
+        return
+      }
+      if (waitForStream && !streamRef.current && retries < 15) {
+        window.setTimeout(() => tryOffer(retries + 1), 200)
+        return
+      }
+      void makeOffer(peerId)
+    }
+    window.setTimeout(() => tryOffer(), 300)
+  }
+
   const attachRemoteTrack = (peerId: string, event: RTCTrackEvent) => {
     const track = event.track
     if (!track) {
@@ -880,12 +930,26 @@ function MeetingPage() {
     }
 
     connection.ontrack = (event) => {
+      console.warn(`[WebRTC] ontrack from ${peerId}: ${event.track.kind} ${event.track.readyState}`)
       attachRemoteTrack(peerId, event)
     }
 
     connection.onconnectionstatechange = () => {
+      console.warn(`[WebRTC] conn state ${peerId}: ${connection.connectionState}`)
       if (connection.connectionState === 'failed') {
         setRtcTip('有成员连接失败，建议刷新页面后重试。')
+      }
+    }
+
+    connection.oniceconnectionstatechange = () => {
+      console.warn(`[WebRTC] ice state ${peerId}: ${connection.iceConnectionState}`)
+      if (connection.iceConnectionState === 'failed') {
+        setTimeout(() => {
+          if (peersRef.current.get(peerId) === connection) {
+            peersRef.current.delete(peerId)
+            void makeOffer(peerId)
+          }
+        }, 2000)
       }
     }
 
@@ -895,6 +959,13 @@ function MeetingPage() {
   const makeOffer = async (targetId: string) => {
     try {
       const connection = createPeerConnection(targetId)
+      const state = connection.signalingState
+      if (state === 'have-local-offer' || state === 'have-remote-offer') {
+        return
+      }
+      if (state !== 'stable') {
+        return
+      }
       const offer = await connection.createOffer()
       await connection.setLocalDescription(offer)
       socketRef.current?.emit('signal', {
@@ -905,7 +976,8 @@ function MeetingPage() {
           sdp: offer,
         } satisfies RoomMessage,
       })
-    } catch {
+    } catch (error) {
+      console.warn('[WebRTC] makeOffer failed', error)
       setRtcTip('创建通话请求失败，请确认浏览器权限后重试。')
     }
   }
@@ -1028,8 +1100,10 @@ function MeetingPage() {
         // 本地流就绪后，若已有对端连接（socket 先于 getUserMedia 完成），
         // 重新发送 offer 以携带音视频轨道，修复远端看不到摄像头的问题。
         if (peersRef.current.size > 0) {
-          peersRef.current.forEach((_peer, peerId) => {
-            void makeOffer(peerId)
+          peersRef.current.forEach((connection, peerId) => {
+            if (connection.signalingState === 'stable') {
+              void makeOffer(peerId)
+            }
           })
         }
         const devices = await navigator.mediaDevices.enumerateDevices()
@@ -1169,10 +1243,11 @@ function MeetingPage() {
           }
           updateUrlPwd('')
         }
+        // socket id 较小者向较大者发 offer，保证有且仅有一方发起
         roomMembers
           .filter((member) => member.id && member.id !== selfId)
           .forEach((member) => {
-            void makeOffer(member.id)
+            scheduleOffer(member.id)
           })
       },
     )
@@ -1195,15 +1270,7 @@ function MeetingPage() {
       upsertMember(member)
       const selfId = localMemberIdRef.current
       if (member.id && selfId && member.id !== selfId) {
-        // 等待本地流就绪后再发送 Offer，避免 Offer 不带音视频轨道
-        const tryOffer = (retries = 0) => {
-          if (streamRef.current || retries >= 10) {
-            void makeOffer(member.id)
-            return
-          }
-          window.setTimeout(() => tryOffer(retries + 1), 200)
-        }
-        window.setTimeout(() => tryOffer(), 400)
+        scheduleOffer(member.id)
       }
     })
 
@@ -1230,6 +1297,7 @@ function MeetingPage() {
         delete clone[id]
         return clone
       })
+      pendingCandidatesRef.current.delete(id)
       const connection = peersRef.current.get(id)
       connection?.close()
       peersRef.current.delete(id)
@@ -1316,9 +1384,21 @@ function MeetingPage() {
     })
 
     socket.on('signal', async ({ fromId, signal }: { fromId: string; signal: RoomMessage }) => {
+      const selfId = localMemberIdRef.current
       const connection = createPeerConnection(fromId)
       try {
         if (signal.type === 'offer') {
+          const offerCollision =
+            signal.type === 'offer' &&
+            (connection.signalingState === 'have-local-offer' ||
+              connection.signalingState === 'have-remote-offer')
+          if (offerCollision && !isPolitePeer(selfId, fromId)) {
+            console.warn(`[WebRTC] ignore glare offer from ${fromId}`)
+            return
+          }
+          if (offerCollision && isPolitePeer(selfId, fromId)) {
+            await connection.setLocalDescription({ type: 'rollback' } as RTCSessionDescriptionInit)
+          }
           await connection.setRemoteDescription(new RTCSessionDescription(signal.sdp))
           const answer = await connection.createAnswer()
           await connection.setLocalDescription(answer)
@@ -1330,12 +1410,22 @@ function MeetingPage() {
               sdp: answer,
             } satisfies RoomMessage,
           })
+          await flushPendingCandidates(fromId, connection)
         } else if (signal.type === 'answer') {
+          if (connection.signalingState !== 'have-local-offer') {
+            return
+          }
           await connection.setRemoteDescription(new RTCSessionDescription(signal.sdp))
+          await flushPendingCandidates(fromId, connection)
         } else if (signal.type === 'candidate') {
+          if (!connection.remoteDescription) {
+            queuePendingCandidate(fromId, signal.candidate)
+            return
+          }
           await connection.addIceCandidate(new RTCIceCandidate(signal.candidate))
         }
-      } catch {
+      } catch (error) {
+        console.warn('[WebRTC] signal handling failed', error)
         setRtcTip('实时连接协商失败，可尝试重新加入会议。')
       }
     })
@@ -1627,20 +1717,30 @@ function MeetingPage() {
   }
 
   const askAi = async () => {
-    const prompt = aiPrompt.trim()//先把用户输入的内容前后空格去掉
+    const prompt = aiPrompt.trim()
     if (!prompt) {
       return
     }
-    setAiLoading(true)//进入加载防止重复点击
+    setAiLoading(true)
     try {
+      const history = aiChatHistoryRef.current
       const { answer, degraded, detail } = await askAiAssistant({
         roomId,
         username,
         prompt,
         messages: publicChatMessages,
-      })//如果ai是降级生成的也就是服务器压力大就会把排障信息拼接到后买回答
+        history,
+      })
       const extra = degraded && detail?.trim() ? `\n\n【排障】${detail.trim()}` : ''
-      setAiAnswer(`${answer}${extra}`)
+      const finalAnswer = `${answer}${extra}`
+      setAiAnswer(finalAnswer)
+      // 保存到对话历史
+      const newHistory: Array<{ role: 'user' | 'assistant'; content: string }> = [
+        ...history,
+        { role: 'user', content: prompt },
+        { role: 'assistant', content: finalAnswer },
+      ]
+      aiChatHistoryRef.current = newHistory.slice(-20) // 保留最近 20 轮
       setAiPrompt('')
     } catch (error) {
       setRtcTip(error instanceof Error ? error.message : 'AI 助手调用失败')
@@ -1665,6 +1765,46 @@ function MeetingPage() {
       setRtcTip(error instanceof Error ? error.message : '会议纪要生成失败')
     } finally {
       setSummaryLoading(false)
+    }
+  }
+
+  const runAgentMvp = async () => {
+    const goal = agentGoal.trim()
+    if (!goal) {
+      setRtcTip('请先输入智能体目标。')
+      return
+    }
+    setAgentLoading(true)
+    try {
+      const history = agentHistoryRef.current
+      const data = await runAiAgent({
+        roomId,
+        username,
+        goal,
+        messages: publicChatMessages,
+        members,
+        history,
+      })
+      setAgentAnswer(data.answer ?? '')
+      setAgentPlan(Array.isArray(data.plan) ? data.plan : [])
+      setAgentSteps(Array.isArray(data.steps) ? data.steps : [])
+      setAgentReview(typeof data.review === 'string' ? data.review : '')
+      // 保存到对话历史
+      const answerText = data.answer ?? ''
+      const newHistory: Array<{ role: 'user' | 'assistant'; content: string }> = [
+        ...history,
+        { role: 'user', content: `目标：${goal}` },
+        { role: 'assistant', content: answerText },
+      ]
+      agentHistoryRef.current = newHistory.slice(-20)
+      setAgentGoal('')
+      if (data.degraded) {
+        setRtcTip(`智能体已降级输出：${data.detail ?? '请检查 AI 配置'}`)
+      }
+    } catch (error) {
+      setRtcTip(error instanceof Error ? error.message : '智能体执行失败')
+    } finally {
+      setAgentLoading(false)
     }
   }
 
@@ -2616,6 +2756,48 @@ function MeetingPage() {
             />
             <button onClick={() => void askAi()} disabled={aiLoading}>
               {aiLoading ? '思考中...' : '提问 AI'}
+            </button>
+          </div>
+
+          <h3>智能体 MVP</h3>
+          <div className="chat-panel">
+            {agentAnswer ? (
+              <>
+                {agentPlan.length > 0 ? (
+                  <div className="chat-time">
+                    计划：{agentPlan.map((p, idx) => `${idx + 1}.${p}`).join('  ')}
+                  </div>
+                ) : null}
+                <pre className="summary-text">{agentAnswer}</pre>
+                {agentSteps.length > 0 ? (
+                  <div className="chat-time">
+                    工具执行：
+                    {agentSteps.map((step, idx) => (
+                      <div key={`${step.tool}-${idx}`}>
+                        {idx + 1}. {step.tool}（{step.reason}）
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+                {agentReview ? (
+                  <div className="chat-time">
+                    复盘：
+                    <div>{agentReview}</div>
+                  </div>
+                ) : null}
+              </>
+            ) : (
+              <p>输入一个目标，智能体会自动规划步骤并给出结论（MVP）。</p>
+            )}
+          </div>
+          <div className="chat-input-row">
+            <input
+              value={agentGoal}
+              onChange={(event) => setAgentGoal(event.target.value)}
+              placeholder="例如：根据会中消息生成答辩行动计划"
+            />
+            <button onClick={() => void runAgentMvp()} disabled={agentLoading}>
+              {agentLoading ? '执行中...' : '运行智能体'}
             </button>
           </div>
 
