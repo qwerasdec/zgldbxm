@@ -264,6 +264,197 @@ const handleAiSummary = async (req, res) => {
   }
 }
 
+const createAgentFallback = (goal, plan, steps, review = '') => {
+  const lines = [
+    'AI 智能体当前处于演示降级模式（未配置或无法调用外部模型）。',
+    `目标：${goal}`,
+    '',
+    '已执行步骤：',
+    ...steps.map((s, idx) => `${idx + 1}. ${s.tool} - ${s.reason}`),
+    review ? `\n复盘：${review}` : '',
+    '',
+    '建议：请配置 AI_API_KEY / ARK_API_KEY 后再试，以获得更高质量策略输出。',
+  ]
+  return { answer: lines.join('\n'), plan, steps, review }
+}
+
+const buildAgentPlan = (goal) => {
+  const text = String(goal ?? '').toLowerCase()
+  const plan = ['梳理会中关键信息', '抽取可执行行动项', '给出最终答辩建议']
+  if (text.includes('纪要') || text.includes('总结') || text.includes('summary')) {
+    return ['提取会议核心讨论', '生成结构化纪要草稿', '给出会后跟进建议']
+  }
+  if (text.includes('答辩') || text.includes('演讲') || text.includes('汇报')) {
+    return ['分析当前讨论亮点和风险', '整理答辩表达提纲', '输出可直接陈述的结论']
+  }
+  if (text.includes('待办') || text.includes('行动') || text.includes('todo')) {
+    return ['识别任务相关讨论', '汇总负责人与优先级', '输出可执行待办清单']
+  }
+  return plan
+}
+
+const toolExtractTopics = (messages) => {
+  const uniq = new Set()
+  const topics = []
+  for (const item of messages.slice(-40)) {
+    const t = String(item?.text ?? '').trim()
+    if (!t) {
+      continue
+    }
+    const normalized = t.slice(0, 30)
+    if (uniq.has(normalized)) {
+      continue
+    }
+    uniq.add(normalized)
+    topics.push(`- ${item?.sender ?? '成员'}：${t}`)
+    if (topics.length >= 10) {
+      break
+    }
+  }
+  return topics.join('\n') || '（会中暂无可用文本）'
+}
+
+const toolBuildActionItems = (messages) => {
+  const keywords = ['需要', '建议', 'TODO', '待办', '后续', '优化', '修复', '确认', '安排']
+  const picked = []
+  for (const item of messages.slice(-60)) {
+    const text = String(item?.text ?? '')
+    if (!text.trim()) {
+      continue
+    }
+    if (keywords.some((k) => text.includes(k))) {
+      picked.push(`- ${item?.sender ?? '成员'}：${text.trim()}`)
+    }
+    if (picked.length >= 8) {
+      break
+    }
+  }
+  return picked.join('\n') || '（未识别到明确待办，建议人工补充负责人与截止时间）'
+}
+
+const toolMemberSnapshot = (members) => {
+  const names = members.map((m) => `${m?.name ?? '成员'}${m?.isHost ? '(主持人)' : ''}`)
+  return names.length > 0 ? names.join('、') : '（暂无成员信息）'
+}
+
+const toolRiskHints = (messages) => {
+  const riskWords = ['风险', '问题', '失败', '报错', '超时', '冲突', '卡住', '不行', '延迟']
+  const hits = []
+  for (const item of messages.slice(-80)) {
+    const text = String(item?.text ?? '').trim()
+    if (!text) {
+      continue
+    }
+    if (riskWords.some((k) => text.includes(k))) {
+      hits.push(`- ${item?.sender ?? '成员'}：${text}`)
+    }
+    if (hits.length >= 6) {
+      break
+    }
+  }
+  return hits.join('\n') || '（未识别到明显风险语句）'
+}
+
+const handleAiAgent = async (req, res) => {
+  const payload = await readJsonBody(req)
+  const goal = String(payload.goal ?? '').trim()
+  const roomId = String(payload.roomId ?? '')
+  const username = String(payload.username ?? '参会者')
+  const messages = Array.isArray(payload.messages) ? payload.messages : []
+  const members = Array.isArray(payload.members) ? payload.members : []
+
+  if (!goal) {
+    res.writeHead(400, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ error: 'goal is required' }))
+    return
+  }
+
+  const plan = buildAgentPlan(goal)
+  const steps = [
+    {
+      tool: 'extract_topics',
+      reason: '梳理会中上下文',
+      output: toolExtractTopics(messages),
+    },
+    {
+      tool: 'extract_actions',
+      reason: '提取可执行任务',
+      output: toolBuildActionItems(messages),
+    },
+    {
+      tool: 'member_snapshot',
+      reason: '确认参会角色',
+      output: toolMemberSnapshot(members),
+    },
+    {
+      tool: 'risk_hints',
+      reason: '识别潜在风险',
+      output: toolRiskHints(messages),
+    },
+  ]
+
+  if (!AI_API_KEY) {
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify(createAgentFallback(goal, plan, steps, '未连接外部模型，无法进行深度复盘。')))
+    return
+  }
+
+  try {
+    const toolContext = steps.map((s, i) => `${i + 1}. [${s.tool}] ${s.reason}\n${s.output}`).join('\n\n')
+    const draft = await callOpenAI(
+      [
+        {
+          role: 'system',
+          content: '你是会议智能体的执行器。请基于工具输出给出“草稿答案”，结构包含：结论、证据、行动项、下一步。不要编造事实。',
+        },
+        {
+          role: 'user',
+          content: `会议号：${roomId}\n提问人：${username}\n目标：${goal}\n执行计划：\n${plan.map((p, i) => `${i + 1}. ${p}`).join('\n')}\n\n工具输出：\n${toolContext}`,
+        },
+      ],
+      0.3,
+    )
+    const review = await callOpenAI(
+      [
+        {
+          role: 'system',
+          content: '你是会议智能体复盘器。请检查草稿是否有臆测、遗漏、行动项不明确，并给出简短复盘建议（3-5行）。',
+        },
+        {
+          role: 'user',
+          content: `目标：${goal}\n\n工具输出：\n${toolContext}\n\n草稿：\n${draft}`,
+        },
+      ],
+      0.2,
+    )
+    const answer = await callOpenAI(
+      [
+        {
+          role: 'system',
+          content:
+            '你是会议智能体终稿器。请根据草稿和复盘意见生成最终回答，格式固定：\n1) 结论\n2) 证据\n3) 行动项（负责人+截止建议）\n4) 下一步\n不得编造未出现的事实。',
+        },
+        {
+          role: 'user',
+          content: `目标：${goal}\n\n草稿：\n${draft}\n\n复盘意见：\n${review}`,
+        },
+      ],
+      0.25,
+    )
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ answer, plan, steps, review }))
+  } catch (error) {
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(
+      JSON.stringify({
+        ...createAgentFallback(goal, plan, steps, '调用模型失败，已回退为规则化结果。'),
+        degraded: true,
+        detail: error instanceof Error ? error.message : 'Unknown error',
+      }),
+    )
+  }
+}
+
 const callOpenAITranscription = async (buffer, mimeType) => {
   const form = new FormData()
   form.append('file', new Blob([buffer], { type: mimeType }), 'speech.webm')
@@ -784,6 +975,16 @@ const server = http.createServer(async (req, res) => {
     } catch (error) {
       res.writeHead(500, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ error: error instanceof Error ? error.message : 'AI summary failed' }))
+    }
+    return
+  }
+
+  if (req.method === 'POST' && req.url === '/api/ai/agent') {
+    try {
+      await handleAiAgent(req, res)
+    } catch (error) {
+      res.writeHead(500, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: error instanceof Error ? error.message : 'AI agent failed' }))
     }
     return
   }
